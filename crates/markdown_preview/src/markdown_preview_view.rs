@@ -7,13 +7,13 @@ use editor::scroll::Autoscroll;
 use editor::{Editor, EditorEvent, SelectionEffects};
 use gpui::{
     App, ClickEvent, Context, Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement,
-    IntoElement, IsZero, ListState, ParentElement, Render, RetainAllImageCache, Styled,
+    IntoElement, IsZero, ListState, ParentElement, Render, RetainAllImageCache, Stateful, Styled,
     Subscription, Task, WeakEntity, Window, list,
 };
 use language::LanguageRegistry;
 use settings::Settings;
 use theme::ThemeSettings;
-use ui::prelude::*;
+use ui::{Scrollbar, ScrollbarState, prelude::*};
 use workspace::item::{Item, ItemHandle};
 use workspace::{Pane, Workspace};
 
@@ -38,6 +38,9 @@ pub struct MarkdownPreviewView {
     language_registry: Arc<LanguageRegistry>,
     parsing_markdown_task: Option<Task<Result<()>>>,
     mode: MarkdownPreviewMode,
+    scrollbar_state: ScrollbarState,
+    show_scrollbar: bool,
+    hide_scrollbar_task: Option<Task<()>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -312,6 +315,7 @@ impl MarkdownPreviewView {
                 },
             );
 
+            let scrollbar_state = ScrollbarState::new(list_state.clone());
             let mut this = Self {
                 selected_block: 0,
                 active_editor: None,
@@ -323,6 +327,9 @@ impl MarkdownPreviewView {
                 parsing_markdown_task: None,
                 image_cache: RetainAllImageCache::new(cx),
                 mode,
+                scrollbar_state,
+                show_scrollbar: false,
+                hide_scrollbar_task: None,
             };
 
             this.set_editor(active_editor, window, cx);
@@ -564,6 +571,40 @@ impl MarkdownPreviewView {
         self.list_state.scroll_to(new_scroll);
         cx.notify();
     }
+
+    fn render_vertical_scrollbar(&self, _: &mut Context<Self>) -> Option<Stateful<Div>> {
+        if !self.show_scrollbar && !self.scrollbar_state.is_dragging() {
+            return None;
+        }
+
+        Some(
+            div()
+                .occlude()
+                .id("markdown-preview-scrollbar")
+                .absolute()
+                .top_0()
+                .right_0()
+                .bottom_0()
+                .w(px(12.))
+                .cursor_default()
+                .children(Scrollbar::vertical(self.scrollbar_state.clone())),
+        )
+    }
+
+    fn hide_scrollbar_later(&mut self, cx: &mut Context<Self>) {
+        const SCROLLBAR_SHOW_INTERVAL: Duration = Duration::from_secs(1);
+        self.hide_scrollbar_task = Some(cx.spawn(async move |view, cx| {
+            cx.background_executor()
+                .timer(SCROLLBAR_SHOW_INTERVAL)
+                .await;
+            let _ = view.update(cx, |view, cx| {
+                if !view.scrollbar_state.is_dragging() {
+                    view.show_scrollbar = false;
+                    cx.notify();
+                }
+            });
+        }));
+    }
 }
 
 impl Focusable for MarkdownPreviewView {
@@ -616,6 +657,21 @@ impl Render for MarkdownPreviewView {
             .track_focus(&self.focus_handle(cx))
             .on_action(cx.listener(MarkdownPreviewView::scroll_page_up))
             .on_action(cx.listener(MarkdownPreviewView::scroll_page_down))
+            .on_mouse_move(cx.listener(|this, _, _, cx| {
+                this.show_scrollbar = true;
+                this.hide_scrollbar_later(cx);
+                cx.notify();
+            }))
+            .on_scroll_wheel(cx.listener(|this, _, _, cx| {
+                this.show_scrollbar = true;
+                this.hide_scrollbar_later(cx);
+                cx.notify();
+            }))
+            .on_hover(cx.listener(|this, hovered, _, cx| {
+                if !hovered {
+                    this.hide_scrollbar_later(cx);
+                }
+            }))
             .size_full()
             .bg(cx.theme().colors().editor_background)
             .p_4()
@@ -624,7 +680,15 @@ impl Render for MarkdownPreviewView {
             .child(
                 div()
                     .flex_grow()
-                    .map(|this| this.child(list(self.list_state.clone()).size_full())),
+                    .relative()
+                    .child(
+                        div()
+                            .size_full()
+                            .child(list(self.list_state.clone()).size_full()),
+                    )
+                    .when_some(self.render_vertical_scrollbar(cx), |this, scrollbar| {
+                        this.child(scrollbar)
+                    }),
             )
     }
 }
